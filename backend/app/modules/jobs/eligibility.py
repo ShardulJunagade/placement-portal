@@ -26,13 +26,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import CYCLE_NOT_FOUND
 from app.core.plan import ActorContext, Plan, Reason, Rejection, ScopeIds, StateOp
 from app.core.registry import Registry
+from app.domain.pathways import derived_rule_facts
 from app.domain.rules import (
     RuleContext,
+    RuleSemantics,
     evaluate,
     parse_rule,
     summarize,
     taxonomy_ids,
 )
+from app.domain.shared import Outcome
 from app.modules.jobs.commands import (
     JobRow,
     fetch_job,
@@ -41,6 +44,7 @@ from app.modules.jobs.commands import (
     now,
 )
 from app.modules.offers.derivations import placement_placed_enrollments
+from app.modules.profiles.academics import load_academic_session
 from app.modules.profiles.fields import PROFILE_COLUMNS
 from app.modules.taxonomies.labels import resolve_labels
 
@@ -52,11 +56,15 @@ MEMBER_PROFILE_SELECT = ", ".join(f"p.{column}" for column in PROFILE_COLUMNS)
 ACTIVE_MEMBERS = f"""
     SELECT
         e.id AS enrollment_id, e.roll_number, u.full_name, u.email,
+        prog.structure AS program_structure,
+        prog.primary_degree_id AS program_primary_degree_id,
+        prog.secondary_degree_id AS program_secondary_degree_id,
         {MEMBER_PROFILE_SELECT}
     FROM cycle_memberships m
     JOIN enrollments e ON e.id = m.enrollment_id
     JOIN users u ON u.id = e.user_id
     LEFT JOIN profiles p ON p.enrollment_id = e.id
+    LEFT JOIN programs prog ON prog.id = p.program_id
     WHERE m.cycle_id = :cycle_id AND m.status = 'active'
     ORDER BY u.full_name, e.id
 """
@@ -84,6 +92,7 @@ class JobEligibilitySummary(BaseModel):
     cycle_id: UUID
     job_id: UUID
     eligibility_summary: str
+    eligibility_rule_version: int
     eligible_count: int
     member_count: int
     # Who, not just how many. The builder's impact preview is a dry run of this
@@ -111,12 +120,18 @@ class JobEligibilityState:
     job: JobRow | None
     members: tuple[dict[str, object], ...]
     labels: dict[UUID, str]
+    current_academic_session: int | None
 
 
 def member_profiles_with_placement(
     rows: Sequence[sa.RowMapping], placed: Collection[UUID]
 ) -> tuple[dict[str, object], ...]:
-    """Add the batch-loaded DER-1 fact to profiles before pure evaluation."""
+    """Add the derived facts a rule reads to profiles before pure evaluation.
+
+    The batch-loaded DER-1 placement fact, and the disciplines the student may
+    be matched on (ELG-2) -- which no column holds, because it depends on the
+    enrollment's shape and, for a dual major, their year of study.
+    """
     profiles: list[dict[str, object]] = []
     for row in rows:
         profile: dict[str, object] = dict(row)
@@ -154,6 +169,7 @@ async def _load_eligibility(
         job=job,
         members=member_profiles_with_placement(members, placed),
         labels=await resolve_labels(tx, taxonomy_ids(input_value.eligibility_rule)),
+        current_academic_session=await load_academic_session(tx, lock=lock),
     )
 
 
@@ -161,6 +177,10 @@ def evaluate_members(
     rule: dict[str, object] | None,
     members: tuple[dict[str, object], ...],
     labels: dict[UUID, str],
+    *,
+    outcome: Outcome,
+    current_session: int | None,
+    semantics: RuleSemantics = RuleSemantics.CURRENT,
 ) -> tuple[MemberVerdict, ...]:
     """The rule alone against every active member's live profile (JOB-2.2).
 
@@ -172,6 +192,12 @@ def evaluate_members(
     verdicts: list[MemberVerdict] = []
     for member in members:
         enrollment_id = cast(UUID, member["enrollment_id"])
+        evaluated = dict(member)
+        evaluated.update(
+            derived_rule_facts(
+                evaluated, outcome=outcome, current_session=current_session
+            )
+        )
         if rule is None:
             verdicts.append(
                 MemberVerdict(
@@ -183,21 +209,22 @@ def evaluate_members(
                 )
             )
             continue
-        outcome = evaluate(
+        evaluation = evaluate(
             rule,
-            member,
+            evaluated,
             RuleContext(
                 not_placement_placed=not bool(member["placement_placed_global"])
             ),
             labels=labels,
+            semantics=semantics,
         )
         verdicts.append(
             MemberVerdict(
                 enrollment_id=enrollment_id,
                 full_name=str(member["full_name"]),
                 roll_number=cast("str | None", member["roll_number"]),
-                eligible=outcome.verdict,
-                reasons=outcome.failures,
+                eligible=evaluation.verdict,
+                reasons=evaluation.failures,
             )
         )
     return tuple(verdicts)
@@ -226,10 +253,18 @@ def _decide_update_job_eligibility(
 
     rule = input_value.eligibility_rule
     summary_text = summarize(rule, state.labels)
-    verdicts = evaluate_members(rule, state.members, state.labels)
+    verdicts = evaluate_members(
+        rule,
+        state.members,
+        state.labels,
+        outcome=state.job.outcome,
+        current_session=state.current_academic_session,
+        semantics=RuleSemantics.CURRENT,
+    )
     eligible = [verdict for verdict in verdicts if verdict.eligible]
     changed = (
         rule != state.job.eligibility_rule
+        or state.job.eligibility_rule_version != int(RuleSemantics.CURRENT)
         or summary_text != state.job.eligibility_summary
     )
 
@@ -241,6 +276,7 @@ def _decide_update_job_eligibility(
                     model="jobs",
                     values={
                         "eligibility_rule": rule,
+                        "eligibility_rule_version": int(RuleSemantics.CURRENT),
                         "eligibility_summary": summary_text,
                     },
                     where={"id": state.job.id},
@@ -257,10 +293,12 @@ def _decide_update_job_eligibility(
             "details": {
                 "before": {
                     "eligibility_rule": state.job.eligibility_rule,
+                    "eligibility_rule_version": state.job.eligibility_rule_version,
                     "eligibility_summary": state.job.eligibility_summary,
                 },
                 "after": {
                     "eligibility_rule": rule,
+                    "eligibility_rule_version": int(RuleSemantics.CURRENT),
                     "eligibility_summary": summary_text,
                 },
                 # Recorded because a rule edit is invisible in its effects: it
@@ -274,6 +312,7 @@ def _decide_update_job_eligibility(
             "cycle_id": str(state.job.cycle_id),
             "job_id": str(state.job.id),
             "eligibility_summary": summary_text,
+            "eligibility_rule_version": int(RuleSemantics.CURRENT),
             "eligible_count": len(eligible),
             "member_count": len(verdicts),
             "members": [

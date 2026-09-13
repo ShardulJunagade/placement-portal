@@ -9,6 +9,8 @@ from uuid import UUID
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from app.domain.academics import academic_standing_status
+from app.modules.profiles.academics import load_academic_session
 from app.modules.profiles.fields import (
     DECLARABLE_FIELDS,
     FIELDS,
@@ -73,13 +75,26 @@ async def taxonomy_options(
         ("branches", "branches"),
         ("minors", "minors"),
     ):
+        # A programme carries its structure: the form asks for a second
+        # discipline when the programme has one, rather than the student
+        # ticking a box that could disagree with it.
+        columns = (
+            "id, name, structure" if table == "programs" else "id, name"
+        )
         rows = (
             await connection.execute(
-                sa.text(f"SELECT id, name FROM {table} WHERE is_active ORDER BY name, id")
+                sa.text(  # noqa: S608
+                    f"SELECT {columns} FROM {table} WHERE is_active ORDER BY name, id"
+                )
             )
         ).mappings().all()
         taxonomies[key] = [
-            {"id": str(cast(UUID, row["id"])), "name": str(row["name"])} for row in rows
+            {
+                "id": str(cast(UUID, row["id"])),
+                "name": str(row["name"]),
+                **({"structure": str(row["structure"])} if table == "programs" else {}),
+            }
+            for row in rows
         ]
     branch_rows = (
         await connection.execute(
@@ -130,6 +145,7 @@ async def me_profile(engine: AsyncEngine, enrollment_id: UUID) -> dict[str, obje
             )
         ).mappings().all()
         taxonomies, program_branches = await taxonomy_options(connection)
+        current_session = await load_academic_session(connection)
 
     values: dict[str, object] = {column: None for column in PROFILE_COLUMNS}
     if profile is not None:
@@ -148,6 +164,7 @@ async def me_profile(engine: AsyncEngine, enrollment_id: UUID) -> dict[str, obje
         "declared_at": declared_at.isoformat() if declared_at is not None else None,
         "fields": _editable_registry(values, declared=declared_at is not None),
         "values": values,
+        "academic_standing": academic_standing_status(values, current_session),
         "resumes": [
             {
                 "id": str(cast(UUID, row["id"])),

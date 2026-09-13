@@ -16,16 +16,13 @@ class Profile(UUIDPrimaryKeyMixin, UpdatedAtMixin, Base):
     __tablename__ = "profiles"
     __table_args__ = (
         sa.UniqueConstraint("enrollment_id", name="uq_profiles_enrollment_id"),
+        sa.CheckConstraint("study_year BETWEEN 1 AND 8", name="ck_profiles_study_year_range"),
         sa.CheckConstraint(
-            "NOT (is_dual_major AND is_dual_degree)", name="ck_profiles_one_dual_kind"
+            "study_year_session BETWEEN 1900 AND 2100", name="ck_profiles_study_year_session_range"
         ),
         sa.CheckConstraint(
-            "is_dual_degree = (secondary_program_id IS NOT NULL)",
-            name="ck_profiles_dual_degree_program",
-        ),
-        sa.CheckConstraint(
-            "secondary_branch_id IS NULL OR is_dual_major OR is_dual_degree",
-            name="ck_profiles_secondary_branch_kind",
+            "(study_year IS NULL) = (study_year_session IS NULL)",
+            name="ck_profiles_study_year_pair",
         ),
     )
 
@@ -38,23 +35,15 @@ class Profile(UUIDPrimaryKeyMixin, UpdatedAtMixin, Base):
     primary_branch_id: Mapped[UUID | None] = mapped_column(
         sa.ForeignKey("branches.id", ondelete="RESTRICT")
     )
-    # A student completing two majors at once, one primary and one secondary
-    # (the design review section 4.32).  NOT NULL because "unknown" is not one of the
-    # answers: every student either is or is not, and PRO-1 asks the secondary
-    # branch of exactly the ones who are.
-    is_dual_major: Mapped[bool] = mapped_column(
-        sa.Boolean(), nullable=False, server_default=sa.false()
-    )
-    # Dual degrees keep BTech as program_id and name the postgraduate degree.
-    is_dual_degree: Mapped[bool] = mapped_column(
-        sa.Boolean(), nullable=False, server_default=sa.false()
-    )
-    secondary_program_id: Mapped[UUID | None] = mapped_column(
-        sa.ForeignKey("programs.id", ondelete="RESTRICT")
-    )
+    # Whether a second discipline applies, and which degree it belongs to, is
+    # the programme's to say (app.domain.pathways) -- the profile names the
+    # programme and the two disciplines, and nothing that can contradict them.
     secondary_branch_id: Mapped[UUID | None] = mapped_column(
         sa.ForeignKey("branches.id", ondelete="RESTRICT")
     )
+    # Nullable for the additive collection release: never guess existing students' standing.
+    study_year: Mapped[int | None] = mapped_column(sa.Integer())
+    study_year_session: Mapped[int | None] = mapped_column(sa.Integer())
     graduating_year: Mapped[int | None] = mapped_column(sa.Integer())
     cpi: Mapped[Decimal | None] = mapped_column(sa.Numeric(4, 2))
     active_backlogs: Mapped[int | None] = mapped_column(sa.Integer())

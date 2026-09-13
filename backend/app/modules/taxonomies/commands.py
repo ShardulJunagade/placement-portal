@@ -12,12 +12,14 @@ from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import (
+    INVALID_FIELD_VALUE,
     INVALID_REQUEST,
     TAXONOMY_ITEM_NOT_FOUND,
     TAXONOMY_NAME_CONFLICT,
 )
 from app.core.plan import ActorContext, Plan, Reason, Rejection, ScopeIds, StateOp
 from app.core.registry import Registry
+from app.domain.shared import ProgramStructure
 
 
 class TaxonomyKind(StrEnum):
@@ -32,6 +34,7 @@ class SettingKey(StrEnum):
     STRIKES_PER_PENALTY = "strikes_per_penalty"
     SESSION_HOURS = "session_hours"
     SES_SENDER = "ses_sender"
+    ACADEMIC_SESSION_START_YEAR = "academic_session_start_year"
 
 
 class UpsertTaxonomyItemInput(BaseModel):
@@ -43,6 +46,30 @@ class UpsertTaxonomyItemInput(BaseModel):
     is_active: bool = True
     action: Literal["upsert", "delete"] = "upsert"
     branch_ids: list[UUID] | None = None
+    #: Programmes only: how many disciplines this one enrols a student in, and
+    #: the degrees each discipline is drawn from (ELG-2, app.domain.pathways).
+    structure: ProgramStructure | None = None
+    primary_degree_id: UUID | None = None
+    secondary_degree_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_structure(self) -> UpsertTaxonomyItemInput:
+        components = (self.primary_degree_id, self.secondary_degree_id)
+        if self.kind is not TaxonomyKind.PROGRAM:
+            if self.structure is not None or any(components):
+                raise ValueError("only a program has a structure")
+            return self
+        structure = self.structure or ProgramStructure.SINGLE
+        if structure is ProgramStructure.SINGLE:
+            if any(components):
+                raise ValueError(
+                    "a single program offers its own disciplines and names no degrees"
+                )
+        elif not all(components):
+            raise ValueError(
+                "a dual major or dual degree must name both component degrees"
+            )
+        return self
 
     @field_validator("name")
     @classmethod
@@ -100,6 +127,11 @@ class SetSettingInput(BaseModel):
         elif self.key is SettingKey.SESSION_HOURS:
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError("session_hours must be a positive integer")
+        elif self.key is SettingKey.ACADEMIC_SESSION_START_YEAR:
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or not 1900 <= value <= 2100
+            ):
+                raise ValueError("academic_session_start_year must be 1900–2100 or null")
         elif not isinstance(value, str):
             raise ValueError("ses_sender must be a string")
         return self
@@ -124,6 +156,11 @@ class TaxonomyState:
     missing_branch_ids: tuple[UUID, ...]
     inactive_branch_ids: tuple[UUID, ...]
     new_map_ids: tuple[tuple[UUID, UUID], ...]
+    existing_structure: str | None
+    existing_primary_degree_id: UUID | None
+    existing_secondary_degree_id: UUID | None
+    combined_components: tuple[UUID, ...]
+    nonsingle_components: tuple[UUID, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,10 +173,13 @@ class SettingState:
 _REFERENCE_QUERIES: dict[TaxonomyKind, str] = {
     TaxonomyKind.PROGRAM: """
         SELECT
-            (SELECT count(*) FROM profiles
-             WHERE program_id = :item_id OR secondary_program_id = :item_id) +
+            (SELECT count(*) FROM profiles WHERE program_id = :item_id) +
             (SELECT count(*) FROM job_program_ctc WHERE program_id = :item_id) +
-            (SELECT count(*) FROM program_branches WHERE program_id = :item_id)
+            (SELECT count(*) FROM program_branches WHERE program_id = :item_id) +
+            -- A combined programme is built out of this one, so retiring it
+            -- would leave that programme describing a degree that is gone.
+            (SELECT count(*) FROM programs
+             WHERE primary_degree_id = :item_id OR secondary_degree_id = :item_id)
     """,
     TaxonomyKind.BRANCH: """
         SELECT
@@ -175,7 +215,11 @@ async def _load_taxonomy(
             {"key": lock_key},
         )
     lock_clause = " FOR UPDATE" if lock else ""
-    columns = "id, name, is_active"
+    columns = (
+        "id, name, is_active, structure, primary_degree_id, secondary_degree_id"
+        if input_value.kind is TaxonomyKind.PROGRAM
+        else "id, name, is_active"
+    )
     if input_value.item_id is not None:
         existing = (
             await tx.execute(
@@ -198,6 +242,34 @@ async def _load_taxonomy(
         ).mappings().one_or_none()
 
     item_id = existing["id"] if existing is not None else uuid4()
+    requested_components = tuple(
+        component
+        for component in (input_value.primary_degree_id, input_value.secondary_degree_id)
+        if component is not None
+    )
+    combined_components: tuple[UUID, ...] = ()
+    nonsingle_components: tuple[UUID, ...] = ()
+    if requested_components:
+        found = (
+            await tx.execute(
+                sa.text(
+                    "SELECT id, structure FROM programs "
+                    "WHERE id = ANY(CAST(:ids AS uuid[]))"
+                ),
+                {"ids": list(dict.fromkeys(requested_components))},
+            )
+        ).mappings().all()
+        by_id = {row["id"]: str(row["structure"]) for row in found}
+        combined_components = tuple(
+            component for component in requested_components if component in by_id
+        )
+        # A component degree must itself be a plain degree: a programme built
+        # out of a combined one would describe a shape nothing can evaluate.
+        nonsingle_components = tuple(
+            component
+            for component in requested_components
+            if by_id.get(component) not in (None, ProgramStructure.SINGLE.value)
+        )
     name_conflict = False
     if input_value.name is not None:
         conflict_id = await tx.scalar(
@@ -274,6 +346,23 @@ async def _load_taxonomy(
         missing_branch_ids=missing,
         inactive_branch_ids=inactive,
         new_map_ids=new_map_ids,
+        existing_structure=(
+            str(existing["structure"])
+            if existing is not None and input_value.kind is TaxonomyKind.PROGRAM
+            else None
+        ),
+        existing_primary_degree_id=(
+            existing["primary_degree_id"]
+            if existing is not None and input_value.kind is TaxonomyKind.PROGRAM
+            else None
+        ),
+        existing_secondary_degree_id=(
+            existing["secondary_degree_id"]
+            if existing is not None and input_value.kind is TaxonomyKind.PROGRAM
+            else None
+        ),
+        combined_components=combined_components,
+        nonsingle_components=nonsingle_components,
     )
 
 
@@ -304,6 +393,9 @@ def _item_snapshot(
     name: str,
     is_active: bool,
     branch_ids: tuple[UUID, ...] | None,
+    structure: str | None,
+    primary_degree_id: UUID | None,
+    secondary_degree_id: UUID | None,
 ) -> dict[str, object]:
     snapshot: dict[str, object] = {
         "id": str(item_id),
@@ -311,7 +403,18 @@ def _item_snapshot(
         "is_active": is_active,
     }
     if branch_ids is not None:
-        snapshot["branch_ids"] = [str(branch_id) for branch_id in branch_ids]
+        snapshot.update(
+            {
+                "branch_ids": [str(branch_id) for branch_id in branch_ids],
+                "structure": structure,
+                "primary_degree_id": (
+                    str(primary_degree_id) if primary_degree_id is not None else None
+                ),
+                "secondary_degree_id": (
+                    str(secondary_degree_id) if secondary_degree_id is not None else None
+                ),
+            }
+        )
     return snapshot
 
 
@@ -369,6 +472,9 @@ def _decide_taxonomy(
             name=state.existing_name,
             is_active=bool(state.existing_active),
             branch_ids=before_branches,
+            structure=state.existing_structure,
+            primary_degree_id=state.existing_primary_degree_id,
+            secondary_degree_id=state.existing_secondary_degree_id,
         )
         if state.existing_name is not None
         else None
@@ -395,6 +501,9 @@ def _decide_taxonomy(
                 name=state.existing_name,
                 is_active=False,
                 branch_ids=before_branches,
+                structure=state.existing_structure,
+                primary_degree_id=state.existing_primary_degree_id,
+                secondary_degree_id=state.existing_secondary_degree_id,
             )
             active_after: bool | None = False
         else:
@@ -412,6 +521,42 @@ def _decide_taxonomy(
             active_after = None
         branch_ids_after = before_branches
     else:
+        requested_components = tuple(
+            component
+            for component in (
+                input_value.primary_degree_id, input_value.secondary_degree_id
+            )
+            if component is not None
+        )
+        recursive_path = next(
+            (
+                path
+                for path, component in (
+                    ("primary_degree_id", input_value.primary_degree_id),
+                    ("secondary_degree_id", input_value.secondary_degree_id),
+                )
+                if component == state.item_id
+            ),
+            None,
+        )
+        if recursive_path is not None:
+            return Rejection(reasons=[Reason(
+                code=INVALID_FIELD_VALUE,
+                human="A combined program cannot be built out of itself",
+                path=recursive_path,
+            )])
+        if len(state.combined_components) != len(requested_components):
+            return Rejection(reasons=[Reason(
+                code=TAXONOMY_ITEM_NOT_FOUND,
+                human="A component degree does not exist",
+                path="primary_degree_id",
+            )])
+        if state.nonsingle_components:
+            return Rejection(reasons=[Reason(
+                code=INVALID_FIELD_VALUE,
+                human="A component degree must itself be a single program",
+                path="primary_degree_id",
+            )])
         creating = state.existing_name is None
         name_after = input_value.name or state.existing_name
         assert name_after is not None
@@ -421,17 +566,47 @@ def _decide_taxonomy(
             if state.requested_branch_ids is not None
             else state.existing_branch_ids
         ) if input_value.kind is TaxonomyKind.PROGRAM else None
+        # Omitting the structure leaves an existing programme's alone: a
+        # rename or a deactivation must not quietly flatten a dual degree back
+        # into a plain one. Only a create defaults it, and only to single.
+        structure_values: dict[str, object] = (
+            {
+                "structure": (input_value.structure or ProgramStructure.SINGLE).value,
+                "primary_degree_id": input_value.primary_degree_id,
+                "secondary_degree_id": input_value.secondary_degree_id,
+            }
+            if input_value.kind is TaxonomyKind.PROGRAM
+            and (creating or input_value.structure is not None)
+            else {}
+        )
+        structure_changed = bool(structure_values) and (
+            (
+                state.existing_structure,
+                state.existing_primary_degree_id,
+                state.existing_secondary_degree_id,
+            )
+            != (
+                structure_values["structure"],
+                structure_values["primary_degree_id"],
+                structure_values["secondary_degree_id"],
+            )
+        )
         if creating:
             values: dict[str, object] = {
                 "id": state.item_id,
                 "name": name_after,
                 "is_active": active_after,
+                **structure_values,
             }
             operations.append(
                 StateOp(op="insert", model=input_value.kind.value, values=values)
             )
-        elif state.existing_name != name_after or state.existing_active != active_after:
-            values = {"name": name_after, "is_active": active_after}
+        elif (
+            state.existing_name != name_after
+            or state.existing_active != active_after
+            or structure_changed
+        ):
+            values = {"name": name_after, "is_active": active_after, **structure_values}
             operations.append(
                 StateOp(
                     op="update",
@@ -464,11 +639,29 @@ def _decide_taxonomy(
                 )
                 for branch_id, map_id in state.new_map_ids
             )
+        structure_after = (
+            str(structure_values["structure"])
+            if structure_values
+            else state.existing_structure
+        )
+        primary_degree_after = (
+            input_value.primary_degree_id
+            if structure_values
+            else state.existing_primary_degree_id
+        )
+        secondary_degree_after = (
+            input_value.secondary_degree_id
+            if structure_values
+            else state.existing_secondary_degree_id
+        )
         after = _item_snapshot(
             item_id=state.item_id,
             name=name_after,
             is_active=active_after,
             branch_ids=branch_ids_after,
+            structure=structure_after,
+            primary_degree_id=primary_degree_after,
+            secondary_degree_id=secondary_degree_after,
         )
         changed = before != after
         action = "created" if creating else ("updated" if changed else "unchanged")

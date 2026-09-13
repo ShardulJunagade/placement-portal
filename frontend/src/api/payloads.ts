@@ -22,6 +22,8 @@ export interface CycleHeader {
 export interface TaxonomyRef {
   id: string;
   name: string;
+  /** Programmes only: "single", "dual_major" or "dual_degree" (ELG-2). */
+  structure?: string;
 }
 
 /* -------------------------------------------------------------- cycles --- */
@@ -289,6 +291,7 @@ export interface BuilderPayload {
   overrides: SubjectOverride[];
   eligibility: {
     rule: Record<string, unknown> | null;
+    rule_version: number;
     summary: string;
     impact: {
       eligible_count: number;
@@ -461,6 +464,7 @@ export interface StaffCycleExternalPayload {
 
 export interface DashboardPayload {
   enrollment_id: string;
+  academic_standing?: AcademicStandingPayload;
   memberships: {
     id: string;
     status: string;
@@ -507,6 +511,10 @@ export interface TaxonomyItem {
   id: string;
   name: string;
   is_active: boolean;
+  /** Programmes only: the shape of the enrollment they admit (ELG-2). */
+  structure?: string;
+  primary_degree_id?: string | null;
+  secondary_degree_id?: string | null;
 }
 
 export interface TaxonomiesPayload {
@@ -735,7 +743,19 @@ export interface BoardRowPayload {
 
 /* ------------------------------------------------------------ profiles --- */
 
+export interface AcademicStandingPayload {
+  status: "unconfigured" | "missing" | "stale" | "current";
+  current_session: number | null;
+  current_session_label: string | null;
+  study_year: number | null;
+  recorded_session: number | null;
+  min_year: number;
+  max_year: number;
+  collection_only: boolean;
+}
+
 export interface MeProfilePayload {
+  academic_standing?: AcademicStandingPayload;
   enrollment: {
     id: string;
     is_current: boolean;

@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { payload, type MeProfilePayload } from "@/api/payloads";
 import { useCommand, useScreen } from "@/api/useScreen";
 import { PageHeader } from "@/components/PageHeader";
+import { AcademicStandingNotice } from "@/components/AcademicStandingNotice";
 import { PreviewConfirm } from "@/components/PreviewConfirm";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -41,11 +42,19 @@ export function Profile() {
             : "Declare this enrollment once, then keep your own contact, link, and semesterly academic fields current."
         }
       />
+      <AcademicStandingNotice standing={data.academic_standing} onProfile />
       <ProfileFields data={data} />
       <ResumeLibrary data={data} />
     </>
   );
 }
+
+/** Whether the declared programme enrols a second discipline (ELG-2). */
+function holdsSecondDiscipline(data: MeProfilePayload, programId: unknown): boolean {
+  const program = data.taxonomies.programs.find((item) => item.id === programId);
+  return program?.structure !== undefined && program.structure !== "single";
+}
+
 
 function ProfileFields({ data }: { data: MeProfilePayload }) {
   const declared = data.declared_at !== null;
@@ -108,14 +117,14 @@ function ProfileFields({ data }: { data: MeProfilePayload }) {
         ) : null}
         <div className="grid gap-gap-lg sm:grid-cols-2">
           {editable
-            // PRO-1 asks the second major only of the students who have one,
-            // and the server refuses a secondary branch from anyone else, so
-            // the field appears when the answer does.
+            // PRO-1 asks the second discipline only of the programmes that
+            // enrol one, and the server refuses it from anyone else, so the
+            // field appears when the declared programme says it applies.
             .filter(
               (field) =>
-                !["secondary_program_id", "secondary_branch_id"].includes(field.key) ||
-                values["is_dual_degree"] ||
-                (field.key === "secondary_branch_id" && values["is_dual_major"]),
+                field.key !== "study_year_session" &&
+                (field.key !== "secondary_branch_id" ||
+                  holdsSecondDiscipline(data, values["program_id"])),
             )
             .map((field) => (
               <ProfileField
@@ -162,15 +171,46 @@ function ProfileField({
   onSiblingChange?: (key: string, value: unknown) => void;
 }) {
   const stringValue = value === null || value === undefined ? "" : String(value);
+  if (field.key === "study_year") {
+    const session = data.academic_standing?.current_session;
+    const currentValue = allValues.study_year_session === session ? stringValue : "";
+    return (
+      <div id="academic-standing">
+        <Field
+          label="Year of study"
+          hint={session
+            ? `Your actual year now, for ${data.academic_standing?.current_session_label} — not your graduating year or a future internship year.`
+            : "The office must configure the current academic session before you can record your year."}
+        >
+          {(input) => (
+            <Select
+              {...input}
+              value={currentValue}
+              disabled={!session}
+              onChange={(event) => {
+                const year = event.target.value ? Number(event.target.value) : null;
+                onChange(year);
+                onSiblingChange?.("study_year_session", year === null ? null : session);
+              }}
+            >
+              <option value="">Select year…</option>
+              {Array.from({ length: 8 }, (_, index) => (
+                <option key={index + 1} value={index + 1}>Year {index + 1}</option>
+              ))}
+            </Select>
+          )}
+        </Field>
+      </div>
+    );
+  }
   const taxonomy = taxonomyFor(field.key);
   if (taxonomy) {
     let options = data.taxonomies[taxonomy];
     if (field.key === "primary_branch_id" || field.key === "secondary_branch_id") {
-      const program = String(
-        field.key === "secondary_branch_id" && allValues.is_dual_degree
-          ? allValues.secondary_program_id ?? ""
-          : allValues.program_id ?? "",
-      );
+      // Both slots draw on the declared programme, which offers every
+      // discipline its component degrees do; the server checks each slot
+      // against the exact degree it belongs to.
+      const program = String(allValues.program_id ?? "");
       const admitted = new Set(
         data.program_branches
           .filter((row) => row.program_id === program)
@@ -185,45 +225,6 @@ function ProfileField({
             <option value="">None</option>
             {options.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
           </Select>
-        )}
-      </Field>
-    );
-  }
-  if (field.key === "is_dual_major" || field.key === "is_dual_degree") {
-    const dualMajor = field.key === "is_dual_major";
-    return (
-      <Field
-        label={field.label}
-        hint={
-          dualMajor
-            ? "Two majors within the same primary degree."
-            : "A BTech followed by an MTech or MSc in the same enrollment."
-        }
-      >
-        {() => (
-          <label className="flex h-control items-center gap-gap-md text-body-md text-foreground">
-            <Checkbox
-              checked={value === true}
-              onChange={(event) => {
-                // Turning it off clears the second major with it; leaving a
-                // stale branch behind is the contradiction the server rejects.
-                onChange(event.target.checked);
-                if (event.target.checked) {
-                  onSiblingChange?.(
-                    dualMajor ? "is_dual_degree" : "is_dual_major",
-                    false,
-                  );
-                  if (dualMajor) onSiblingChange?.("secondary_program_id", null);
-                } else {
-                  onSiblingChange?.("secondary_branch_id", null);
-                  if (!dualMajor) onSiblingChange?.("secondary_program_id", null);
-                }
-              }}
-            />
-            {dualMajor
-              ? "I am completing a dual major"
-              : "I am completing a dual degree"}
-          </label>
         )}
       </Field>
     );
@@ -258,7 +259,7 @@ function ProfileField({
 }
 
 function taxonomyFor(key: string): "programs" | "branches" | "minors" | null {
-  if (key === "program_id" || key === "secondary_program_id") return "programs";
+  if (key === "program_id") return "programs";
   if (key === "primary_branch_id" || key === "secondary_branch_id") return "branches";
   if (key === "minor1_id" || key === "minor2_id") return "minors";
   return null;

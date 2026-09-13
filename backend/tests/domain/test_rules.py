@@ -6,7 +6,15 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
-from app.domain.rules import RuleContext, RuleField, evaluate, parse_rule
+from app.domain.rules import (
+    SET_FIELDS,
+    RuleContext,
+    RuleField,
+    RuleSemantics,
+    actual_key,
+    evaluate,
+    parse_rule,
+)
 
 CONTEXT = RuleContext(not_placement_placed=True)
 PROGRAM = UUID("00000000-0000-0000-0000-000000000101")
@@ -15,7 +23,12 @@ OTHER_PROGRAM = UUID("00000000-0000-0000-0000-000000000102")
 
 def _verdict(field: str, op: str, expected: object, actual: object) -> bool:
     rule = parse_rule({"field": field, "op": op, "value": expected})
-    return evaluate(rule, {field: actual}, CONTEXT).verdict
+    # A set-valued field reads a derived key beside the column, and answers
+    # from the set of values the student may use; one value is a set of one.
+    rule_field = RuleField(field)
+    key = actual_key(rule_field)
+    live = frozenset({actual}) if rule_field in SET_FIELDS else actual
+    return evaluate(rule, {key: live}, CONTEXT).verdict
 
 
 @pytest.mark.parametrize(
@@ -152,6 +165,70 @@ def test_ELG2_a_satisfied_any_branch_is_never_reported_as_a_failure() -> None:
     assert "primary branch Computer Science" not in result.failures[0].human
 
 
+@pytest.mark.parametrize(
+    "rule,profile",
+    [
+        (
+            {"not": {"field": "active_backlogs", "op": "eq", "value": 0}},
+            {"active_backlogs": None},
+        ),
+        (
+            {
+                "not": {
+                    "field": "program_id",
+                    "op": "in",
+                    "value": [str(PROGRAM)],
+                }
+            },
+            {"eligible_program_ids": None},
+        ),
+        (
+            {
+                "not": {
+                    "not": {"field": "active_backlogs", "op": "eq", "value": 0}
+                }
+            },
+            {"active_backlogs": None},
+        ),
+    ],
+)
+def test_ELG2_negation_cannot_turn_an_unknown_fact_into_eligibility(
+    rule: dict[str, object], profile: dict[str, object]
+) -> None:
+    result = evaluate(parse_rule(rule), profile, CONTEXT)
+    assert result.verdict is False
+    assert len(result.failures) == 1
+    assert "profile" in result.failures[0].human
+    assert result.failures[0].path is not None
+    assert result.failures[0].path.endswith(".not")
+
+
+def test_ELG2_an_any_with_unknown_and_false_is_unknown_and_denied() -> None:
+    result = evaluate(
+        parse_rule(
+            {
+                "any": [
+                    {"field": "active_backlogs", "op": "eq", "value": 0},
+                    {"field": "nationality", "op": "eq", "value": "IN"},
+                ]
+            }
+        ),
+        {"active_backlogs": None, "nationality": "US"},
+        CONTEXT,
+    )
+    assert result.verdict is False
+    assert result.failures[0].path == "$"
+    assert "not recorded" in result.failures[0].human
+
+
+def test_ELG2_legacy_negation_is_versioned_while_new_rules_fail_closed() -> None:
+    rule = parse_rule({"not": {"field": "cpi", "op": "gte", "value": 8}})
+    assert evaluate(rule, {}, CONTEXT).verdict is False
+    assert evaluate(
+        rule, {}, CONTEXT, semantics=RuleSemantics.LEGACY
+    ).verdict is True
+
+
 def test_ELG2_failing_not_never_returns_an_empty_failure_list() -> None:
     result = evaluate(
         parse_rule({"not": {"field": "cpi", "op": "gte", "value": 8}}),
@@ -194,9 +271,15 @@ def test_DER1_context_criterion_is_precomputed_and_pure() -> None:
 def test_ELG2_field_registry_is_exactly_the_approved_academic_set() -> None:
     assert {field.value for field in RuleField} == {
         "program_id",
+        "component_program_id",
         "secondary_program_id",
         "primary_branch_id",
         "secondary_branch_id",
+        # The disciplines a student may be matched on, derived rather than
+        # stored, so one condition covers single, dual-major and dual-degree
+        # enrollments instead of a rule naming both branch columns at once.
+        "discipline_id",
+        "study_year",
         "graduating_year",
         "cpi",
         "active_backlogs",

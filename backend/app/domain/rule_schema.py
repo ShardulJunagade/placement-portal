@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from decimal import ROUND_HALF_UP, Decimal
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from typing import Annotated, cast
 from uuid import UUID
 
@@ -27,11 +27,28 @@ from pydantic import (
 from app.domain.shared import Gender
 
 
+class RuleSemantics(IntEnum):
+    """Persisted evaluator contract; old rules never silently change meaning."""
+
+    LEGACY = 1
+    CURRENT = 2
+
+
+CURRENT_RULE_SEMANTICS = RuleSemantics.CURRENT
+
+
 class RuleField(StrEnum):
+    # Exact programme declared on the profile, in both semantics versions.
     PROGRAM_ID = "program_id"
+    # Explicit v2 predicate for membership in a programme's component degrees.
+    COMPONENT_PROGRAM_ID = "component_program_id"
     SECONDARY_PROGRAM_ID = "secondary_program_id"
     PRIMARY_BRANCH_ID = "primary_branch_id"
     SECONDARY_BRANCH_ID = "secondary_branch_id"
+    #: The disciplines the student may be matched on, decided by
+    #: ``app.domain.pathways`` rather than read from one column.
+    DISCIPLINE_ID = "discipline_id"
+    STUDY_YEAR = "study_year"
     GRADUATING_YEAR = "graduating_year"
     CPI = "cpi"
     ACTIVE_BACKLOGS = "active_backlogs"
@@ -65,15 +82,18 @@ class Criterion(StrEnum):
 UUID_FIELDS = frozenset(
     {
         RuleField.PROGRAM_ID,
+        RuleField.COMPONENT_PROGRAM_ID,
         RuleField.SECONDARY_PROGRAM_ID,
         RuleField.PRIMARY_BRANCH_ID,
         RuleField.SECONDARY_BRANCH_ID,
+        RuleField.DISCIPLINE_ID,
         RuleField.MINOR1_ID,
         RuleField.MINOR2_ID,
     }
 )
 INTEGER_FIELDS = frozenset(
     {
+        RuleField.STUDY_YEAR,
         RuleField.GRADUATING_YEAR,
         RuleField.ACTIVE_BACKLOGS,
         RuleField.TOTAL_BACKLOGS,
@@ -87,14 +107,40 @@ DECIMAL_FIELDS = frozenset(
 # A profile column like every other rule field, so a rule can say "dual majors
 # only" (Behavior ELG-2, the design review section 4.32).
 BOOLEAN_FIELDS = frozenset({RuleField.IS_DUAL_MAJOR, RuleField.IS_DUAL_DEGREE})
+#: Fields whose *actual* value is a set of ids rather than one id, so a
+#: comparison asks whether any of the student's values answers the rule
+#: (ELG-2).  The expected side is still ordinary ids.
+#:
+#: Set-valued v2 predicates are named separately from exact profile fields.
+#: In particular, ``program_id`` remains the declared programme so a BTech–
+#: MTech profile cannot satisfy an MTech-only declared-programme rule.
+SET_FIELDS = frozenset({RuleField.DISCIPLINE_ID, RuleField.COMPONENT_PROGRAM_ID})
 ORDERED_FIELDS = INTEGER_FIELDS | DECIMAL_FIELDS
+ACTUAL_KEY: dict[RuleField, str] = {
+    RuleField.COMPONENT_PROGRAM_ID: "component_program_ids",
+    RuleField.STUDY_YEAR: "current_study_year",
+}
+
+
+def actual_key(
+    field: RuleField, semantics: RuleSemantics = RuleSemantics.CURRENT
+) -> str:
+    if semantics is RuleSemantics.LEGACY and field is RuleField.PROGRAM_ID:
+        return "legacy_program_id"
+    if semantics is RuleSemantics.LEGACY and field is RuleField.STUDY_YEAR:
+        return "study_year"
+    return ACTUAL_KEY.get(field, field.value)
+
+
 # The taxonomy each id-valued field draws from, so a caller can resolve the
 # display names a rule's UUIDs stand for.
 TAXONOMY_OF_FIELD: dict[RuleField, str] = {
     RuleField.PROGRAM_ID: "programs",
+    RuleField.COMPONENT_PROGRAM_ID: "programs",
     RuleField.SECONDARY_PROGRAM_ID: "programs",
     RuleField.PRIMARY_BRANCH_ID: "branches",
     RuleField.SECONDARY_BRANCH_ID: "branches",
+    RuleField.DISCIPLINE_ID: "branches",
     RuleField.MINOR1_ID: "minors",
     RuleField.MINOR2_ID: "minors",
 }

@@ -7,6 +7,7 @@ the actor, students included (the design review section 4.3).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
@@ -49,12 +50,16 @@ from app.domain.memberships import (
     compute_membership_exit_cascade,
     decide_membership_transition,
 )
+from app.domain.pathways import derived_rule_facts, program_structure
 from app.domain.policy import Policy, resolve_policy
-from app.domain.rules import RuleContext, evaluate, taxonomy_ids
+from app.domain.rules import RuleContext, RuleSemantics, evaluate, taxonomy_ids
 from app.domain.shared import (
     ApplicationStatus,
+    CycleKind,
     MembershipStatus,
+    Outcome,
     OutcomeTag,
+    ProgramStructure,
     RuleDomain,
 )
 from app.domain.transitions import TransitionActor
@@ -63,6 +68,7 @@ from app.modules.cycles.commands import CycleRow, fetch_cycle, fetch_policy
 from app.modules.notifications.wording import withdrawal_trigger
 from app.modules.offers.derivations import placement_placed_global
 from app.modules.overrides.service import ApplicableOverride
+from app.modules.profiles.academics import load_academic_session
 from app.modules.profiles.fields import PROFILE_COLUMNS
 from app.modules.taxonomies.labels import resolve_labels
 
@@ -261,6 +267,24 @@ async def _fetch_membership(
     return _membership_row(row) if row is not None else None
 
 
+def _evaluable_profile(
+    row: object,
+    *,
+    outcome: Outcome | None,
+    current_session: int | None,
+) -> dict[str, object] | None:
+    """The loaded row plus context-qualified facts a join rule reads (ELG-2)."""
+    if row is None:
+        return None
+    profile = dict(cast("Mapping[str, object]", row))
+    profile.update(
+        derived_rule_facts(
+            profile, outcome=outcome, current_session=current_session
+        )
+    )
+    return profile
+
+
 async def _load_join(
     tx: AsyncSession, input_value: BaseModel, *, lock: bool
 ) -> JoinState:
@@ -270,15 +294,17 @@ async def _load_join(
     profile = (
         await tx.execute(
             sa.text(
-                # `_PROFILE_SELECT` carries `is_dual_major` like any other
-                # profile column now (the design review section 4.32); PRO-1's
-                # conditional secondary-branch requirement and ELG-2's
-                # dual-major rules both read it from there.
+                # The declared programme says whether a second discipline
+                # applies at all: PRO-1's conditional secondary-branch
+                # requirement and ELG-2's discipline matching both read it.
                 f"SELECT {_PROFILE_SELECT}, p.declared_at, e.roll_number, u.full_name, "  # noqa: S608
-                "u.email "
+                "u.email, prog.structure AS program_structure, "
+                "prog.primary_degree_id AS program_primary_degree_id, "
+                "prog.secondary_degree_id AS program_secondary_degree_id "
                 "FROM enrollments e "
                 "JOIN users u ON u.id = e.user_id "
                 "LEFT JOIN profiles p ON p.enrollment_id = e.id "
+                "LEFT JOIN programs prog ON prog.id = p.program_id "
                 "WHERE e.id = :enrollment_id"
             ),
             {"enrollment_id": input_value.enrollment_id},
@@ -315,7 +341,15 @@ async def _load_join(
             lock=lock,
         ),
         membership_id=uuid4(),
-        profile=dict(profile) if profile is not None else None,
+        profile=_evaluable_profile(
+            profile,
+            outcome=(
+                Outcome(cycle.kind.value)
+                if cycle is not None and cycle.kind is not CycleKind.OPEN
+                else None
+            ),
+            current_session=await load_academic_session(tx, lock=lock),
+        ),
         resume_count=int(resume_count or 0),
         resume_owned=bool(resume_owned),
         email=str(profile["email"]) if profile is not None else None,
@@ -392,11 +426,15 @@ def _join_gate_reasons(
         )
 
     profile = state.profile or {}
+    structure = program_structure(profile.get("program_structure"))
     reasons.extend(
         check_profile_completeness(
             profile,
             resume_count=state.resume_count,
             declared=profile.get("declared_at") is not None,
+            second_discipline=(
+                structure is not None and structure is not ProgramStructure.SINGLE
+            ),
         )
     )
 
@@ -407,6 +445,7 @@ def _join_gate_reasons(
             profile,
             RuleContext(not_placement_placed=state.not_placement_placed),
             labels=state.rule_labels,
+            semantics=RuleSemantics(policy.join_rule_version.value),
         )
         if join_rule is not None
         else None

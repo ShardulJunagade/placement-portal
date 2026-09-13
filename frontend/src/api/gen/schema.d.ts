@@ -991,6 +991,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/commands/retry_staged_row": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Command Retry Staged Row */
+        post: operations["command_retry_staged_row_api_v1_commands_retry_staged_row_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/commands/revoke_penalty": {
         parameters: {
             query?: never;
@@ -4180,6 +4197,8 @@ export interface components {
              * Format: uuid
              */
             cycle_id: string;
+            /** Eligibility Rule Version */
+            eligibility_rule_version: number;
             /** Eligibility Summary */
             eligibility_summary: string;
             /** Eligible Count */
@@ -4718,6 +4737,17 @@ export interface components {
              */
             program_id: string;
         };
+        /**
+         * ProgramStructure
+         * @description How many disciplines a programme enrols a student in, and of what kind.
+         *
+         *     The programme carries this, not the profile: "BTech-MTech Dual Degree" is a
+         *     programme the office admits students into, and a student is in one
+         *     programme.  Two booleans on the profile could say a student was both, or
+         *     neither while naming a second discipline; a programme cannot.
+         * @enum {string}
+         */
+        ProgramStructure: "single" | "dual_major" | "dual_degree";
         /** PromoteWaitlistedCommandPreview */
         PromoteWaitlistedCommandPreview: {
             /** Events */
@@ -5354,6 +5384,49 @@ export interface components {
              */
             resume_id: string;
         };
+        /** RetryStagedRowCommandPreview */
+        RetryStagedRowCommandPreview: {
+            /** Events */
+            events: {
+                [key: string]: unknown;
+            }[];
+            summary: components["schemas"]["RetryStagedRowSummary"];
+        };
+        /** RetryStagedRowCommandRequest */
+        RetryStagedRowCommandRequest: {
+            /**
+             * Dry Run
+             * @default false
+             */
+            dry_run: boolean;
+            /** Idempotency Key */
+            idempotency_key?: string | null;
+            input: components["schemas"]["RetryStagedRowInput"];
+        };
+        /** RetryStagedRowCommandResult */
+        RetryStagedRowCommandResult: {
+            summary: components["schemas"]["RetryStagedRowSummary"];
+        };
+        /** RetryStagedRowInput */
+        RetryStagedRowInput: {
+            /**
+             * Staged Row Id
+             * Format: uuid
+             */
+            staged_row_id: string;
+        };
+        /** RetryStagedRowSummary */
+        RetryStagedRowSummary: {
+            /** Cleared Error */
+            cleared_error: string;
+            /** Institute Email */
+            institute_email: string;
+            /**
+             * Staged Row Id
+             * Format: uuid
+             */
+            staged_row_id: string;
+        };
         /** RevokePenaltyCommandPreview */
         RevokePenaltyCommandPreview: {
             /** Events */
@@ -5646,7 +5719,7 @@ export interface components {
          * SettingKey
          * @enum {string}
          */
-        SettingKey: "strikes_per_penalty" | "session_hours" | "ses_sender";
+        SettingKey: "strikes_per_penalty" | "session_hours" | "ses_sender" | "academic_session_start_year";
         /** SetUserRoleCommandPreview */
         SetUserRoleCommandPreview: {
             /** Events */
@@ -6464,6 +6537,11 @@ export interface components {
             kind: components["schemas"]["TaxonomyKind"];
             /** Name */
             name?: string | null;
+            /** Primary Degree Id */
+            primary_degree_id?: string | null;
+            /** Secondary Degree Id */
+            secondary_degree_id?: string | null;
+            structure?: components["schemas"]["ProgramStructure"] | null;
         };
         /** UpsertTaxonomyItemSummary */
         UpsertTaxonomyItemSummary: {
@@ -8520,6 +8598,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RestoreMembershipCommandResult"] | components["schemas"]["RestoreMembershipCommandPreview"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    command_retry_staged_row_api_v1_commands_retry_staged_row_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RetryStagedRowCommandRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RetryStagedRowCommandResult"] | components["schemas"]["RetryStagedRowCommandPreview"];
                 };
             };
             /** @description Validation Error */

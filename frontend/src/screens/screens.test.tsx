@@ -667,6 +667,24 @@ describe("cycle screens", () => {
     );
   });
 
+  it("rejects duplicate join-rule keys before offering a save", async () => {
+    mockScreens({ [`screens/staff/cycle/${ids.cycle_id}`]: staffCycle });
+    renderScreen(<StaffCycle />, {
+      path: "/staff/cycles/:id",
+      route: `/staff/cycles/${ids.cycle_id}`,
+    });
+
+    fireEvent.change(await screen.findByLabelText("Join rule (JSON)"), {
+      target: {
+        value: '{"field":"cpi","op":"gte","value":8,"value":9}',
+      },
+    });
+    expect(
+      await screen.findByText(/must be valid JSON before it can be saved/),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Preview changes" })).toBeNull();
+  });
+
   it("names every application affected or bypassed by cycle archival", async () => {
     mockScreens({
       [`screens/staff/cycle/${ids.cycle_id}`]: staffCycle,
@@ -1016,7 +1034,10 @@ describe("job builder", () => {
       await screen.findByText(new RegExp(`of ${impact.member_count} active member`)),
     ).toBeInTheDocument();
     // The saved rule round-trips into clauses rather than dropping to JSON.
-    expect(await screen.findByText("Minimum CPI")).toBeInTheDocument();
+    expect(await screen.findByRole("region", { name: "Minimum CPI" })).toBeInTheDocument();
+    // A predicate may be added again; the editor must not globally hide
+    // repeatable clauses needed by more complex rules.
+    expect(screen.getByRole("button", { name: "Minimum CPI" })).toBeInTheDocument();
     expect(container.querySelector("textarea")).toBeNull();
   });
 
@@ -1072,6 +1093,74 @@ describe("job builder", () => {
     });
   });
 
+  it("warns before a legacy rule is explicitly converted", async () => {
+    const legacy = structuredClone(builder) as unknown as BuilderPayload;
+    legacy.eligibility.rule_version = 1;
+    mockScreens({
+      builder: legacy,
+      "screens/staff/taxonomies": adminTaxonomies,
+      "screens/staff/companies": staffCompanies,
+    });
+    renderScreen(<JobBuilder />, {
+      path: "/staff/jobs/:id",
+      route: `/staff/jobs/${ids.job_id}?cycle_id=${ids.cycle_id}`,
+    });
+
+    fireEvent.click(await screen.findByRole("tab", { name: /Eligibility/ }));
+    expect(await screen.findByText(/legacy evaluation semantics/)).toBeInTheDocument();
+    expect(screen.getByText(/preview and record conversion/)).toBeInTheDocument();
+  });
+
+  it("blocks save and impact preview while a visual clause is unfinished", async () => {
+    mockScreens({
+      builder,
+      "screens/staff/taxonomies": adminTaxonomies,
+      "screens/staff/companies": staffCompanies,
+    });
+    renderScreen(<JobBuilder />, {
+      path: "/staff/jobs/:id",
+      route: `/staff/jobs/${ids.job_id}?cycle_id=${ids.cycle_id}`,
+    });
+
+    fireEvent.click(await screen.findByRole("tab", { name: /Eligibility/ }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Maximum total backlogs" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/unfinished condition/);
+    expect(screen.getByRole("button", { name: "Save rule" })).toBeDisabled();
+    expect(screen.getByText(/Complete the draft to preview/)).toBeInTheDocument();
+
+    fireEvent.change(
+      screen.getByRole("spinbutton", { name: "Maximum total backlogs" }), {
+      target: { value: "0" },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save rule" })).toBeEnabled();
+    });
+  });
+
+  it("keeps invalid raw JSON from saving the previous valid rule", async () => {
+    mockScreens({
+      builder,
+      "screens/staff/taxonomies": adminTaxonomies,
+      "screens/staff/companies": staffCompanies,
+    });
+    const { container } = renderScreen(<JobBuilder />, {
+      path: "/staff/jobs/:id",
+      route: `/staff/jobs/${ids.job_id}?cycle_id=${ids.cycle_id}`,
+    });
+
+    fireEvent.click(await screen.findByRole("tab", { name: /Eligibility/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit as JSON" }));
+    const textarea = container.querySelector("textarea")!;
+    fireEvent.change(textarea, { target: { value: '{"field":' } });
+
+    expect(await screen.findByText(/Invalid JSON value/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save rule" })).toBeDisabled();
+    expect(screen.getByText(/Complete the draft to preview/)).toBeInTheDocument();
+  });
+
   it("builds a nested rule through the group controls, never the JSON box", async () => {
     // O.5: LLD §9.1 makes JSON the *advanced* fallback, and while it was the
     // only door a coordinator could not express a rule the engine supports.
@@ -1099,15 +1188,15 @@ describe("job builder", () => {
     ).toBeInTheDocument();
 
     // The palette inside an option is filtered per option, not globally:
-    // "branch is CSE" in one and "branch is EE" in the other is the entire
-    // point, and a globally filtered palette would hide the second one.
+    // "discipline is CSE" in one and "discipline is EE" in the other is the
+    // entire point, and a globally filtered palette would hide the second one.
     const optionOne = screen.getByText("Option 1").closest("li")!;
     const optionTwo = screen.getByText("Option 2").closest("li")!;
     expect(
-      within(optionOne).getByRole("button", { name: /Primary branches/ }),
+      within(optionOne).getByRole("button", { name: /Disciplines/ }),
     ).toBeInTheDocument();
     expect(
-      within(optionTwo).getByRole("button", { name: /Primary branches/ }),
+      within(optionTwo).getByRole("button", { name: /Disciplines/ }),
     ).toBeInTheDocument();
 
     // And the JSON escape hatch was never opened.

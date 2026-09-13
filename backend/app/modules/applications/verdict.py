@@ -21,6 +21,7 @@ and asserts the verdicts and their reason lists are identical.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import cast
@@ -36,14 +37,23 @@ from app.domain.gates import (
     apply_eligibility_override,
     evaluate_gates,
 )
+from app.domain.pathways import derived_rule_facts
 from app.domain.policy import resolve_policy
-from app.domain.rules import Labels, RuleContext, evaluate, profile_taxonomy_ids, taxonomy_ids
+from app.domain.rules import (
+    Labels,
+    RuleContext,
+    RuleSemantics,
+    evaluate,
+    profile_taxonomy_ids,
+    taxonomy_ids,
+)
 from app.domain.shared import CycleKind, MembershipStatus, Outcome, RuleDomain
 from app.modules.cycles.commands import POLICY_COLUMNS
 from app.modules.jobs.commands import JOB_COLUMNS
 from app.modules.jobs.eligibility import MEMBER_PROFILE_SELECT
 from app.modules.offers.derivations import offer_facts
 from app.modules.overrides.service import ApplicableOverride, applicable
+from app.modules.profiles.academics import load_academic_session
 from app.modules.taxonomies.labels import resolve_labels
 
 Executor = AsyncConnection | AsyncSession
@@ -151,13 +161,26 @@ class StudentContext:
     max_accepted_offers: int | None
     cap_used: int
     now: datetime
+    current_academic_session: int | None
 
 
 @dataclass(frozen=True, slots=True)
 class Verdict:
     eligible: bool
     reasons: tuple[Reason, ...]
+    evaluated_profile: dict[str, object]
     applied_override_ids: tuple[UUID, ...] = ()
+
+
+def _evaluable_profile(row: object) -> dict[str, object]:
+    """The loaded row plus the facts a rule reads but no column holds (ELG-2).
+
+    Snapshotted with the rest, so the ELG-4 record of what the rule saw stays
+    complete when a fact is derived rather than stored.
+    """
+    if row is None:
+        return {}
+    return dict(cast("Mapping[str, object]", row))
 
 
 async def load_student_context(
@@ -192,10 +215,16 @@ async def load_student_context(
                 # snapshot is "the registry fields", so the name and roll number
                 # come along -- an application that cannot say whose it was is
                 # not a snapshot.
-                f"SELECT {MEMBER_PROFILE_SELECT}, u.full_name, e.roll_number "  # noqa: S608
+                f"SELECT {MEMBER_PROFILE_SELECT}, u.full_name, e.roll_number, "  # noqa: S608
+                # The programme shape the rule reads, and which the ELG-4
+                # snapshot must therefore record alongside it.
+                "prog.structure AS program_structure, "
+                "prog.primary_degree_id AS program_primary_degree_id, "
+                "prog.secondary_degree_id AS program_secondary_degree_id "
                 "FROM enrollments e "
                 "JOIN users u ON u.id = e.user_id "
                 "LEFT JOIN profiles p ON p.enrollment_id = e.id "
+                "LEFT JOIN programs prog ON prog.id = p.program_id "
                 "WHERE e.id = :enrollment_id"
             ),
             {"enrollment_id": enrollment_id},
@@ -225,7 +254,7 @@ async def load_student_context(
         membership_status=(
             MembershipStatus(membership) if membership is not None else MembershipStatus.PENDING
         ),
-        profile=dict(profile_row) if profile_row is not None else {},
+        profile=_evaluable_profile(profile_row),
         penalty_active=penalty_active,
         penalty_blocks_applications=policy.penalty_blocks_applications.value,
         placement_placed_global=facts.placement_placed_global,
@@ -233,6 +262,7 @@ async def load_student_context(
         max_accepted_offers=policy.max_accepted_offers.value,
         cap_used=facts.cap_used,
         now=now,
+        current_academic_session=await load_academic_session(executor, lock=lock),
     )
 
 
@@ -278,6 +308,21 @@ def gate_overrides(resolved: tuple[ApplicableOverride, ...]) -> tuple[GateOverri
     )
 
 
+def profile_for_rule(
+    context: StudentContext, outcome: Outcome
+) -> dict[str, object]:
+    """The exact live facts a job rule sees, also stored in APP-1's snapshot."""
+    profile = dict(context.profile)
+    profile.update(
+        derived_rule_facts(
+            profile,
+            outcome=outcome,
+            current_session=context.current_academic_session,
+        )
+    )
+    return profile
+
+
 def compute_verdict(
     context: StudentContext,
     job: sa.RowMapping,
@@ -314,16 +359,22 @@ def compute_verdict(
     )
     reasons = list(gates.failures)
     applied = list(gates.applied_override_ids)
+    evaluated_profile = profile_for_rule(context, Outcome(job["outcome"]))
+    semantics = RuleSemantics(int(job["eligibility_rule_version"]))
+    # APP-1 snapshots the evaluator contract as well as the facts. Without it,
+    # an unchanged tree could not reconstruct its historical verdict.
+    evaluated_profile["rule_semantics_version"] = int(semantics)
 
     rule = cast("dict[str, object] | None", job["eligibility_rule"])
     if rule is not None:
         outcome = evaluate(
             rule,
-            context.profile,
+            evaluated_profile,
             RuleContext(
                 not_placement_placed=not context.placement_placed_global
             ),
             labels=labels,
+            semantics=semantics,
         )
         # ELG-2's rule is the one domain an eligibility override bypasses; the
         # standing gates above have their own domains and are untouched by it.
@@ -334,5 +385,6 @@ def compute_verdict(
     return Verdict(
         eligible=not reasons,
         reasons=tuple(reasons),
+        evaluated_profile=evaluated_profile,
         applied_override_ids=tuple(applied),
     )

@@ -285,6 +285,7 @@ function EditProfile({
 }
 
 const PROFILE_NUMBERS = new Set([
+  "study_year_session",
   "graduating_year",
   "cpi",
   "active_backlogs",
@@ -292,14 +293,9 @@ const PROFILE_NUMBERS = new Set([
 ]);
 const PROFILE_TAXONOMIES: Record<string, "programs" | "branches"> = {
   program_id: "programs",
-  secondary_program_id: "programs",
   primary_branch_id: "branches",
   secondary_branch_id: "branches",
 };
-const BOOLEAN_OPTIONS = [
-  { value: "true", label: "Yes" },
-  { value: "false", label: "No" },
-] as const;
 const GENDER_OPTIONS = [
   { value: "male", label: "Male" },
   { value: "female", label: "Female" },
@@ -327,14 +323,12 @@ function profileChoice(key: string, label: string, data: StudentRecordPayload): 
       })),
     };
   }
-  if (key === "is_dual_major" || key === "is_dual_degree") {
+  if (key === "study_year") {
     return {
-      name: key,
-      label,
-      kind: "select",
-      initialValue: live === true ? "true" : "false",
-      options: BOOLEAN_OPTIONS,
-      coerce: "boolean",
+      name: key, label, kind: "select", initialValue,
+      options: Array.from({ length: 8 }, (_, index) => ({
+        value: String(index + 1), label: `Year ${index + 1}`,
+      })),
     };
   }
   if (key === "gender") {

@@ -1173,6 +1173,7 @@ function EligibilityTab({
 }) {
   const taxonomies = useScreen("staff/taxonomies");
   const [rule, setRule] = useState<Rule | null>(data.eligibility.rule);
+  const [ruleValid, setRuleValid] = useState(true);
   const save = useCommand("update_job_eligibility");
   const taxonomy = taxonomies.data
     ? payload<TaxonomiesPayload>(taxonomies.data)
@@ -1205,7 +1206,7 @@ function EligibilityTab({
               description="Students who already applied under the old rule keep their applications — an eligibility edit never reaches back."
               confirmLabel="Save rule"
               trigger={
-                <Button variant="primary" size="sm" disabled={disabled}>
+                <Button variant="primary" size="sm" disabled={disabled || !ruleValid}>
                   Save rule
                 </Button>
               }
@@ -1214,6 +1215,12 @@ function EligibilityTab({
         </CardHeader>
         <CardBody className="flex flex-col gap-gap-lg">
           {save.isError ? <ErrorState error={save.error} title="Could not save" /> : null}
+          {data.eligibility.rule_version < 2 ? (
+            <p className="rounded border border-warning-border bg-warning-subtle p-gap-lg text-body-sm text-foreground">
+              This saved rule keeps its legacy evaluation semantics. Saving it will
+              preview and record conversion to the current fail-closed semantics.
+            </p>
+          ) : null}
           <div className="rounded border border-border bg-muted p-gap-lg">
             <p className="text-label-caps uppercase text-muted-foreground">
               What students will read
@@ -1230,7 +1237,9 @@ function EligibilityTab({
               minors: taxonomy.minors,
             }}
             disabled={disabled}
+            outcome={data.job.outcome}
             onChange={setRule}
+            onValidityChange={setRuleValid}
           />
         </CardBody>
       </Card>
@@ -1241,6 +1250,7 @@ function EligibilityTab({
         rule={rule}
         saved={data.eligibility.rule}
         impact={data.eligibility.impact}
+        valid={ruleValid}
       />
     </div>
   );

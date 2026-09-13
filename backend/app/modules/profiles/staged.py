@@ -8,6 +8,7 @@ future login (the design review 4.15 ruling 9).  Rows for one address apply in
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import cast
@@ -19,17 +20,24 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import (
     STAGED_ROW_ALREADY_APPLIED,
+    STAGED_ROW_NOT_ERRORED,
     STAGED_ROW_NOT_FOUND,
 )
 from app.core.plan import ActorContext, Plan, Reason, Rejection, ScopeIds, StateOp
 from app.core.registry import Registry
+from app.domain.academics import academic_standing_reasons
+from app.domain.pathways import ProgramPathway
+from app.domain.shared import ProgramStructure
 from app.modules.identity.commands import (
     LoginInput,
     LoginState,
     PostLoginHooks,
     post_login_hooks,
 )
-from app.modules.profiles.commands import program_branch_reasons
+from app.modules.profiles.commands import (
+    load_program_pathways,
+    program_branch_reasons,
+)
 from app.modules.profiles.fields import (
     BULK_FIELDS,
     FIELDS_BY_KEY,
@@ -42,6 +50,9 @@ from app.modules.profiles.fields import (
 
 HOOK_NAME = "staged_profile_rows"
 ROW_AUDIT_ACTION = "staged_profile_row.applied"
+LEGACY_PROGRAM_FIELDS = frozenset(
+    {"is_dual_major", "is_dual_degree", "secondary_program_id"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +78,7 @@ class StagedLoginState:
     known_ids: frozenset[UUID]
     active_ids: frozenset[UUID]
     program_branch_pairs: frozenset[tuple[UUID, UUID]]
+    program_pathways: Mapping[UUID, ProgramPathway]
     roll_conflicts: frozenset[str]
 
 
@@ -198,8 +210,76 @@ async def load_staged_rows(
         known_ids=frozenset(known),
         active_ids=frozenset(active),
         program_branch_pairs=frozenset(pairs),
+        program_pathways=await load_program_pathways(tx),
         roll_conflicts=frozenset(roll_conflicts),
     )
+
+
+def _legacy_identifier(value: object) -> UUID | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, UUID):
+        return value
+    try:
+        return UUID(str(value).strip())
+    except (AttributeError, ValueError):
+        return None
+
+
+def _adapt_legacy_program_fields(
+    fields: Mapping[str, object],
+    pathways: Mapping[UUID, ProgramPathway],
+) -> tuple[dict[str, object], str | None]:
+    """Translate a pre-0017 staged enrollment without altering its payload.
+
+    Old bulk uploads wrote both false flags on every row.  A dual row named its
+    component degree(s), while the canonical profile names the one combined
+    programme with exactly that structure.  Anything less than one exact match
+    is refused rather than guessed.
+    """
+    adapted = dict(fields)
+    if not LEGACY_PROGRAM_FIELDS.intersection(adapted):
+        return adapted, None
+
+    raw_major = adapted.pop("is_dual_major", False)
+    raw_degree = adapted.pop("is_dual_degree", False)
+    raw_secondary = adapted.pop("secondary_program_id", None)
+    if not isinstance(raw_major, bool) or not isinstance(raw_degree, bool):
+        return {}, "Legacy dual-program flags must be true or false"
+    if raw_major and raw_degree:
+        return {}, "A staged enrollment cannot be both dual major and dual degree"
+
+    primary = _legacy_identifier(adapted.get("program_id"))
+    secondary = _legacy_identifier(raw_secondary)
+    if not raw_major and not raw_degree:
+        if secondary is not None:
+            return {}, "A secondary program requires a dual-degree enrollment"
+        return adapted, None
+    if primary is None:
+        return {}, "A legacy dual enrollment must name its primary program"
+    if raw_major and secondary is not None:
+        return {}, "A dual-major enrollment must not name a secondary program"
+    if raw_degree and secondary is None:
+        return {}, "A dual-degree enrollment must name its secondary program"
+
+    expected_structure = (
+        ProgramStructure.DUAL_MAJOR if raw_major else ProgramStructure.DUAL_DEGREE
+    )
+    expected_secondary = primary if raw_major else secondary
+    matches = [
+        program_id
+        for program_id, pathway in pathways.items()
+        if pathway.structure is expected_structure
+        and pathway.primary_degree_id == primary
+        and pathway.secondary_degree_id == expected_secondary
+    ]
+    if len(matches) != 1:
+        return {}, (
+            "No unique combined program matches this staged enrollment; "
+            "an administrator must configure its program mapping"
+        )
+    adapted["program_id"] = matches[0]
+    return adapted, None
 
 
 def _row_problems(
@@ -211,7 +291,12 @@ def _row_problems(
     """Validate one staged row against the running effective profile (pure)."""
     problems: list[str] = []
     resolved: dict[str, object] = {}
-    for key, value in row.fields.items():
+    fields, legacy_error = _adapt_legacy_program_fields(
+        row.fields, state.program_pathways
+    )
+    if legacy_error is not None:
+        return {}, legacy_error, roll_number
+    for key, value in fields.items():
         if key not in BULK_FIELDS:
             problems.append(f"{key} is not an admin-managed field")
             continue
@@ -219,6 +304,7 @@ def _row_problems(
             resolved[key] = coerce_field(key, value)
         except FieldValueError as error:
             problems.append(error.human)
+    problems.extend(reason.human for reason in academic_standing_reasons(resolved))
     for key in TAXONOMY_FIELDS:
         identifier = resolved.get(key)
         if isinstance(identifier, UUID) and identifier not in state.active_ids:
@@ -250,7 +336,9 @@ def _row_problems(
     merged.update({key: value for key, value in resolved.items() if key in PROFILE_COLUMNS})
     problems.extend(
         reason.human
-        for reason in program_branch_reasons(merged, state.program_branch_pairs)
+        for reason in program_branch_reasons(
+            merged, state.program_branch_pairs, state.program_pathways
+        )
     )
     if problems:
         return {}, "; ".join(problems), roll_number
@@ -410,23 +498,36 @@ class DeleteStagedRowSummary(BaseModel):
     institute_email: str
 
 
+class RetryStagedRowInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    staged_row_id: UUID
+
+
+class RetryStagedRowSummary(BaseModel):
+    staged_row_id: UUID
+    institute_email: str
+    cleared_error: str
+
+
 @dataclass(frozen=True, slots=True)
 class StagedRowState:
     scope_ids: ScopeIds
     exists: bool
     institute_email: str | None
     applied_at: datetime | None
+    error: str | None
 
 
 async def _load_staged_row(
     tx: AsyncSession, input_value: BaseModel, *, lock: bool
 ) -> StagedRowState:
-    if not isinstance(input_value, DeleteStagedRowInput):
-        raise TypeError("delete_staged_row requires DeleteStagedRowInput")
+    if not isinstance(input_value, DeleteStagedRowInput | RetryStagedRowInput):
+        raise TypeError("The staged row commands require a staged row reference")
     row = (
         await tx.execute(
             sa.text(
-                "SELECT institute_email, applied_at FROM staged_profile_rows "
+                "SELECT institute_email, applied_at, error FROM staged_profile_rows "
                 "WHERE id = :id" + (" FOR UPDATE" if lock else "")
             ),
             {"id": input_value.staged_row_id},
@@ -437,6 +538,7 @@ async def _load_staged_row(
         exists=row is not None,
         institute_email=str(row["institute_email"]) if row is not None else None,
         applied_at=row["applied_at"] if row is not None else None,
+        error=str(row["error"]) if row is not None and row["error"] is not None else None,
     )
 
 
@@ -495,6 +597,84 @@ def _decide_delete_staged_row(
     )
 
 
+def _decide_retry_staged_row(
+    input_value: BaseModel,
+    state: object,
+    _policy: object,
+    _overrides: object,
+    _actor: ActorContext,
+) -> Plan | Rejection:
+    """Re-queue a staged row whose recorded failure no longer stands (PRO-2).
+
+    A failed row is terminal so that a permanently invalid one does not retry on
+    every future login (the design review 4.15 ruling 9).  When the validation
+    that rejected it has since been corrected, that same ruling would strand the
+    row forever, and the student silently keeps an unpopulated profile.  An
+    administrator clears the recorded failure deliberately; the row is then
+    revalidated against current rules at the student's next sign-in, so a row
+    that is still invalid simply fails again rather than applying unchecked.
+    """
+    if not isinstance(input_value, RetryStagedRowInput) or not isinstance(
+        state, StagedRowState
+    ):
+        raise TypeError("Invalid retry_staged_row decision input")
+    if not state.exists:
+        return Rejection(
+            reasons=[
+                Reason(
+                    code=STAGED_ROW_NOT_FOUND,
+                    human="The staged row does not exist",
+                    path="staged_row_id",
+                )
+            ]
+        )
+    if state.applied_at is not None:
+        return Rejection(
+            reasons=[
+                Reason(
+                    code=STAGED_ROW_ALREADY_APPLIED,
+                    human="Applied staged rows are kept as history",
+                    path="staged_row_id",
+                )
+            ]
+        )
+    if state.error is None:
+        return Rejection(
+            reasons=[
+                Reason(
+                    code=STAGED_ROW_NOT_ERRORED,
+                    human="The staged row is already waiting for the student to sign in",
+                    path="staged_row_id",
+                )
+            ]
+        )
+    return Plan(
+        state_ops=[
+            StateOp(
+                op="update",
+                model="staged_profile_rows",
+                values={"error": None},
+                where={"id": input_value.staged_row_id},
+            )
+        ],
+        events=[],
+        deferred=[],
+        audit={
+            "subject_type": "staged_profile_row",
+            "subject_id": input_value.staged_row_id,
+            "details": {
+                "institute_email": state.institute_email,
+                "cleared_error": state.error,
+            },
+        },
+        summary={
+            "staged_row_id": str(input_value.staged_row_id),
+            "institute_email": state.institute_email,
+            "cleared_error": state.error,
+        },
+    )
+
+
 def register_staged_commands(registry: Registry) -> None:
     registry.command(
         name="delete_staged_row",
@@ -506,3 +686,13 @@ def register_staged_commands(registry: Registry) -> None:
         rule_domains=(),
         spec_ids=("PRO-2",),
     )(_decide_delete_staged_row)
+    registry.command(
+        name="retry_staged_row",
+        input_model=RetryStagedRowInput,
+        output_model=RetryStagedRowSummary,
+        actor="admin",
+        scope="none",
+        loader=_load_staged_row,
+        rule_domains=(),
+        spec_ids=("PRO-2",),
+    )(_decide_retry_staged_row)

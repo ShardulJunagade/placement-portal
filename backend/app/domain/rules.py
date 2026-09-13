@@ -9,8 +9,10 @@ site for eligibility rules.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from decimal import InvalidOperation
+from enum import Enum, auto
 from typing import cast
 
 from pydantic import BaseModel, ConfigDict
@@ -22,6 +24,7 @@ from app.domain.rule_schema import (
     DECIMAL_FIELDS,
     INTEGER_FIELDS,
     ORDERED_FIELDS,
+    SET_FIELDS,
     TAXONOMY_OF_FIELD,
     UUID_FIELDS,
     AllNode,
@@ -33,7 +36,9 @@ from app.domain.rule_schema import (
     NotNode,
     RuleField,
     RuleNode,
+    RuleSemantics,
     Scalar,
+    actual_key,
     is_rule_node,
     normalize_actual,
     normalize_expected,
@@ -60,6 +65,7 @@ __all__ = [
     "INTEGER_FIELDS",
     "NO_RULE_SUMMARY",
     "ORDERED_FIELDS",
+    "SET_FIELDS",
     "TAXONOMY_OF_FIELD",
     "UUID_FIELDS",
     "AllNode",
@@ -74,8 +80,10 @@ __all__ = [
     "RuleContext",
     "RuleField",
     "RuleNode",
+    "RuleSemantics",
     "Scalar",
     "Shortfall",
+    "actual_key",
     "evaluate",
     "field_shortfall",
     "is_rule_node",
@@ -98,6 +106,14 @@ class _Failure:
     shortfall: Shortfall
 
 
+class _Truth(Enum):
+    """Internal three-valued result; public eligibility remains pass or deny."""
+
+    FALSE = auto()
+    TRUE = auto()
+    UNKNOWN = auto()
+
+
 class RuleContext(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -117,6 +133,7 @@ def evaluate(
     context: RuleContext,
     *,
     labels: Labels | None = None,
+    semantics: RuleSemantics = RuleSemantics.CURRENT,
 ) -> EvaluationResult:
     """Evaluate ELG-2 against one live profile and return path-addressed failures.
 
@@ -126,9 +143,10 @@ def evaluate(
     :func:`app.domain.rules.taxonomy_ids` for every student- or staff-facing call.
     """
     node = tree if is_rule_node(tree) else parse_rule(tree)
-    verdict, failures = _evaluate_node(
-        cast(RuleNode, node), profile, context, "$", labels or {}
+    truth, failures = _evaluate_node(
+        cast(RuleNode, node), profile, context, "$", labels or {}, semantics
     )
+    verdict = truth is _Truth.TRUE
     reasons = tuple(
         Reason(
             code=NOT_ELIGIBLE,
@@ -154,45 +172,57 @@ def _evaluate_node(
     context: RuleContext,
     path: str,
     labels: Labels,
-) -> tuple[bool, tuple[_Failure, ...]]:
+    semantics: RuleSemantics,
+) -> tuple[_Truth, tuple[_Failure, ...]]:
     if isinstance(node, AllNode):
         failures: list[_Failure] = []
+        child_truths: list[_Truth] = []
         for index, child in enumerate(node.all):
-            child_ok, child_failures = _evaluate_node(
-                child, profile, context, f"{path}.all[{index}]", labels
+            child_truth, child_failures = _evaluate_node(
+                child, profile, context, f"{path}.all[{index}]", labels, semantics
             )
-            if not child_ok:
+            child_truths.append(child_truth)
+            if child_truth is not _Truth.TRUE:
                 failures.extend(child_failures)
-        return not failures, tuple(failures)
+        if _Truth.FALSE in child_truths:
+            return _Truth.FALSE, tuple(failures)
+        if _Truth.UNKNOWN in child_truths:
+            return _Truth.UNKNOWN, tuple(failures)
+        return _Truth.TRUE, ()
     if isinstance(node, AnyNode):
         # Reported as one choice at this node's path, never as its branches'
         # leaves side by side: a student who satisfies one branch's leaves but
         # not another's would otherwise be told a requirement they already meet
         # is the thing blocking them (the design review section 4.19).
         alternatives: list[str] = []
+        saw_unknown = False
         for index, child in enumerate(node.any):
-            child_ok, child_failures = _evaluate_node(
-                child, profile, context, f"{path}.any[{index}]", labels
+            child_truth, child_failures = _evaluate_node(
+                child, profile, context, f"{path}.any[{index}]", labels, semantics
             )
-            if child_ok:
-                return True, ()
+            if child_truth is _Truth.TRUE:
+                return _Truth.TRUE, ()
+            saw_unknown = saw_unknown or child_truth is _Truth.UNKNOWN
             alternatives.append(
                 " and ".join(failure.shortfall.inline for failure in child_failures)
                 or requirement_of(child, labels)
             )
-        return False, (_Failure(path, alternatives_shortfall(alternatives)),)
+        truth = _Truth.UNKNOWN if saw_unknown else _Truth.FALSE
+        return truth, (_Failure(path, alternatives_shortfall(alternatives)),)
     if isinstance(node, NotNode):
-        child_ok, _child_failures = _evaluate_node(
-            node.not_, profile, context, f"{path}.not", labels
+        child_truth, child_failures = _evaluate_node(
+            node.not_, profile, context, f"{path}.not", labels, semantics
         )
-        if not child_ok:
-            return True, ()
-        return False, (_Failure(path, negation_shortfall(node, labels)),)
+        if child_truth is _Truth.FALSE:
+            return _Truth.TRUE, ()
+        if child_truth is _Truth.UNKNOWN:
+            return _Truth.UNKNOWN, child_failures
+        return _Truth.FALSE, (_Failure(path, negation_shortfall(node, labels)),)
     if isinstance(node, CriterionNode):
         if node.criterion is Criterion.NOT_PLACEMENT_PLACED and context.not_placement_placed:
-            return True, ()
-        return False, (_Failure(path, criterion_shortfall(node)),)
-    return _evaluate_field(node, profile, path, labels)
+            return _Truth.TRUE, ()
+        return _Truth.FALSE, (_Failure(path, criterion_shortfall(node)),)
+    return _evaluate_field(node, profile, path, labels, semantics)
 
 
 def requirement_of(node: RuleNode, labels: Labels) -> str:
@@ -205,19 +235,62 @@ def requirement_of(node: RuleNode, labels: Labels) -> str:
 
 
 def _evaluate_field(
-    node: FieldNode, profile: Mapping[str, object], path: str, labels: Labels
-) -> tuple[bool, tuple[_Failure, ...]]:
-    raw_actual = profile.get(node.field.value)
-    passed = False
-    if raw_actual is not None:
-        try:
-            actual = normalize_actual(node.field, raw_actual)
-            passed = _compare(actual, node.value, node.op)
-        except (InvalidOperation, TypeError, ValueError):
-            passed = False
+    node: FieldNode,
+    profile: Mapping[str, object],
+    path: str,
+    labels: Labels,
+    semantics: RuleSemantics,
+) -> tuple[_Truth, tuple[_Failure, ...]]:
+    raw_actual = profile.get(actual_key(node.field, semantics))
+    if node.field in SET_FIELDS:
+        if not isinstance(raw_actual, AbstractSet) or not raw_actual:
+            truth = (
+                _Truth.FALSE
+                if semantics is RuleSemantics.LEGACY
+                else _Truth.UNKNOWN
+            )
+            return truth, (_Failure(path, field_shortfall(node, profile, labels)),)
+        if _compare_set(cast(AbstractSet[object], raw_actual), node.value, node.op):
+            return _Truth.TRUE, ()
+        return _Truth.FALSE, (_Failure(path, field_shortfall(node, profile, labels)),)
+    if raw_actual is None:
+        truth = (
+            _Truth.FALSE if semantics is RuleSemantics.LEGACY else _Truth.UNKNOWN
+        )
+        return truth, (_Failure(path, field_shortfall(node, profile, labels)),)
+    try:
+        actual = normalize_actual(node.field, raw_actual)
+        passed = _compare(actual, node.value, node.op)
+    except (InvalidOperation, TypeError, ValueError):
+        truth = (
+            _Truth.FALSE if semantics is RuleSemantics.LEGACY else _Truth.UNKNOWN
+        )
+        return truth, (_Failure(path, field_shortfall(node, profile, labels)),)
     if passed:
-        return True, ()
-    return False, (_Failure(path, field_shortfall(node, profile, labels)),)
+        return _Truth.TRUE, ()
+    return _Truth.FALSE, (_Failure(path, field_shortfall(node, profile, labels)),)
+
+
+def _compare_set(raw_actual: object, expected: object, op: ComparisonOp) -> bool:
+    """Answer a rule from the set of values the student is allowed to use.
+
+    Unknown and empty sets are classified before this comparison so negation
+    cannot turn missing facts into a pass.  This helper receives known values.
+    """
+    if not isinstance(raw_actual, AbstractSet):
+        return False
+    actual = cast(AbstractSet[object], raw_actual)
+    if op is ComparisonOp.IN:
+        values = cast(tuple[Scalar, ...], expected)
+        return any(value in values for value in actual)
+    if op is ComparisonOp.NOT_IN:
+        values = cast(tuple[Scalar, ...], expected)
+        return all(value not in values for value in actual)
+    if op is ComparisonOp.EQ:
+        return expected in actual
+    if op is ComparisonOp.NE:
+        return expected not in actual
+    return False
 
 
 def _compare(actual: Scalar, expected: object, op: ComparisonOp) -> bool:
